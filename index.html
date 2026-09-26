@@ -303,6 +303,7 @@ button.btn{font:inherit;font-size:14px;font-weight:900}
 .pl-t{font-weight:900;font-size:14px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pl-s{font-size:12px;color:var(--muted);font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pl-s a{color:inherit}
+.pl-wait{margin-left:8px;color:var(--ink-2);font-weight:900}
 .pl-ctrl{grid-area:ctrl;display:flex;gap:8px;align-items:center;justify-content:center}
 .pl-btn{flex:none;width:40px;height:40px;border-radius:50%;border:2px solid var(--edge);background:var(--surface);color:var(--ink);display:grid;place-items:center;cursor:pointer;padding:0}
 .pl-btn svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
@@ -358,7 +359,7 @@ body.has-player main{padding-bottom:190px}
 <div class="player" id="player" hidden>
   <div class="wrap pl-in">
     <a class="pl-av" id="plAv" href="#series" aria-label="このシリーズを開く"></a>
-    <div class="pl-meta"><div class="pl-t" id="plT"></div><div class="pl-s" id="plS"></div></div>
+    <div class="pl-meta"><div class="pl-t" id="plT"></div><div class="pl-s"><span id="plS"></span><span class="pl-wait" id="plWait" hidden>読み込み中…</span></div></div>
     <div class="pl-ctrl">
       <button class="pl-btn pl-skip" id="plBack" type="button" aria-label="15秒戻る"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7"/><path d="M4 3v5h5"/></svg><span class="s">15</span></button>
       <button class="pl-btn pl-main" id="plPlay" type="button" aria-label="再生"></button>
@@ -813,6 +814,9 @@ const Player = GH ? (function(){
   let auto = ld(LS_AUTO, true) !== false;
   const audio = new Audio(); audio.preload = 'none';
   let cur = null, pendingSeek = 0, lastSave = 0, seeking = false, attempt = 0, lastFailed = null;
+  let played = false, retries = 0, anchorFailed = false, stallTimer = null;
+  const LS_DIRECT = 'coten-direct-v1';  // この端末で公式URLが通らなかった記録（14日間は直接URLを先に使う）
+  window.__cotenAudio = audio;
   const el = id => document.getElementById(id);
   const ICON_PLAY = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3v14l12-7z"/></svg>';
   const ICON_PAUSE = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.5 3h4v14h-4zM11.5 3h4v14h-4z"/></svg>';
@@ -822,7 +826,9 @@ const Player = GH ? (function(){
     const full = /^https?:/.test(e.a) ? e.a : DATA.ap + e.a;
     const m = full.match(/\/play\/\d+\/(https?%3A.+)$/i);
     let direct = null; try { direct = m ? decodeURIComponent(m[1]) : null; } catch (err) {}
-    return direct ? [full, direct] : [full];
+    if (!direct) return [full];
+    const preferDirect = Date.now() - (Number(ld(LS_DIRECT, 0)) || 0) < 14 * 864e5;
+    return preferDirect ? [direct, full] : [full, direct];
   };
   const nextOf = e => { if (!e || !e.ser) return null; const i = e.ser.eps.indexOf(e); return e.ser.eps[i + 1] || null; };
   function savePos(force){
@@ -834,8 +840,21 @@ const Player = GH ? (function(){
   }
   function showErr(){
     const p = el('plErr'); if (!cur) return;
-    p.innerHTML = `この回はここで再生できませんでした。<a href="${spotify(cur)}" target="_blank" rel="noopener">Spotifyで開く</a>`;
+    savePos(true); audio.pause();
+    p.innerHTML = `通信が途切れて再生が止まりました。▶を押すと止まったところから再開します。<a href="${spotify(cur)}" target="_blank" rel="noopener">Spotifyで開く</a>`;
     p.hidden = false; paint();
+  }
+  // 再生中の通信切れ：同じURLに止まった位置からつなぎ直す（最大3回）
+  function retry(){
+    if (!cur) return;
+    if (retries >= 3) { showErr(); return; }
+    retries++;
+    const s = audio.getAttribute('src'), t = Math.max(audio.currentTime || 0, pendingSeek || 0, POS[cur.i] || 0), who = cur;
+    if (t > 5) { POS[who.i] = Math.floor(t); sv(LS_POS, POS); }  // 止まった位置を必ず残す
+    setTimeout(() => {
+      if (cur !== who || audio.getAttribute('src') !== s) return;
+      pendingSeek = t; audio.src = s; audio.load(); audio.defaultPlaybackRate = speed; audio.playbackRate = speed; start();
+    }, 1200 * retries);
   }
   function start(){
     const at = audio.getAttribute('src');
@@ -854,6 +873,7 @@ const Player = GH ? (function(){
     lastFailed = s;
     const list = urls(cur);
     if (attempt < list.length - 1) {
+      if (attempt === 0 && !played && /anchor\.fm/.test(s)) anchorFailed = true;
       attempt++;
       if (!pendingSeek) pendingSeek = POS[cur.i] || 0;
       audio.src = list[attempt]; audio.defaultPlaybackRate = speed; audio.playbackRate = speed;
@@ -862,14 +882,18 @@ const Player = GH ? (function(){
   }
   function open(e, fromStart){
     if (cur && cur !== e) savePos(true);
-    cur = e; el('plErr').hidden = true; attempt = 0; lastFailed = null;
+    cur = e; el('plErr').hidden = true; attempt = 0; lastFailed = null; played = false; retries = 0; anchorFailed = false;
     pendingSeek = fromStart ? 0 : (POS[e.i] || 0);
     audio.src = urls(e)[0]; audio.defaultPlaybackRate = speed; audio.playbackRate = speed;
     start();
     el('player').hidden = false; document.body.classList.add('has-player');
     paintMeta(); paint(); media();
   }
-  function toggle(e){ if (cur === e) { if (audio.paused) start(); else audio.pause(); } else open(e); }
+  function toggle(e){
+    if (cur !== e) { open(e); return; }
+    if (audio.error || !el('plErr').hidden) { open(e); return; }  // エラー後は止まった位置から読み込み直す
+    if (audio.paused) start(); else audio.pause();
+  }
   function close(){ audio.pause(); savePos(true); cur = null; audio.removeAttribute('src'); audio.load(); el('player').hidden = true; document.body.classList.remove('has-player'); paint(); }
   function paintMeta(){
     if (!cur) return;
@@ -900,7 +924,7 @@ const Player = GH ? (function(){
   }
   if ('mediaSession' in navigator) {
     const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch (e) {} };
-    h('play', () => start()); h('pause', () => audio.pause());
+    h('play', () => { if (cur) toggle(cur); }); h('pause', () => audio.pause());
     h('seekbackward', () => { audio.currentTime = Math.max(0, audio.currentTime - 15); });
     h('seekforward', () => { audio.currentTime = Math.min(audio.duration || 1e9, audio.currentTime + 30); });
     h('seekto', d => { if (d && isFinite(d.seekTime)) audio.currentTime = d.seekTime; });
@@ -911,10 +935,33 @@ const Player = GH ? (function(){
     pendingSeek = 0; audio.playbackRate = speed; paint();
   });
   audio.addEventListener('play', () => { audio.playbackRate = speed; paint(); });
+  // 読み込み待ちの表示と、長く止まったままのときの再接続
+  const clearStall = () => { clearTimeout(stallTimer); stallTimer = null; el('plWait').hidden = true; };
+  audio.addEventListener('waiting', () => {
+    if (!cur || audio.paused) return;
+    el('plWait').hidden = false;
+    clearTimeout(stallTimer);
+    const t0 = audio.currentTime;
+    stallTimer = setTimeout(() => { if (cur && !audio.paused && Math.abs(audio.currentTime - t0) < 1) { el('plWait').hidden = true; retry(); } }, 20000);
+  });
+  audio.addEventListener('pause', clearStall);
+  audio.addEventListener('playing', () => {
+    clearStall();
+    played = true; retries = 0; el('plErr').hidden = true;
+    if (anchorFailed && !/anchor\.fm/.test(audio.getAttribute('src') || '')) { sv(LS_DIRECT, Date.now()); anchorFailed = false; }
+    paint();
+  });
   audio.addEventListener('pause', () => { savePos(true); paint(); });
+  audio.addEventListener('seeked', () => savePos(true));
   audio.addEventListener('timeupdate', () => { if (!seeking) { const d = audio.duration, t = audio.currentTime; el('plCur').textContent = fmt(t); if (isFinite(d) && d > 0) el('plRange').value = Math.round(t / d * 1000); } savePos(false); });
   audio.addEventListener('durationchange', paint);
-  audio.addEventListener('error', () => { if (cur && audio.getAttribute('src')) fail(); });
+  audio.addEventListener('error', () => {
+    if (!cur || !audio.getAttribute('src')) return;
+    const err = audio.error;
+    if (!err) return;  // すでに別のURLへ切り替え済み（古い失敗の通知）なので無視
+    if (played && (err.code === 2 || err.code === 3)) { retry(); return; }
+    fail();
+  });
   audio.addEventListener('ended', () => {
     const done = cur; if (!done) return;
     delete POS[done.i]; sv(LS_POS, POS);
